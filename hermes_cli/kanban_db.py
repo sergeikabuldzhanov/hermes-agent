@@ -1327,6 +1327,123 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _integrity_check_via_snapshot(path: Path) -> Optional[str]:
+    """Run ``PRAGMA integrity_check`` against a locked-consistent snapshot.
+
+    HERMES_KANBAN_PROBE_SNAPSHOT: probe the DB without ever writing to the
+    live file or its ``-wal``/``-shm`` sidecars. A read/write probe (the old
+    behavior) can trigger a WAL checkpoint from every new process's first
+    ``connect()``; a lock-free ``immutable=1`` probe (upstream PR #60653)
+    can see torn pages mid-checkpoint and misreport a healthy DB as
+    corrupt. ``Connection.backup()`` takes the read locks WAL requires, so
+    the snapshot is a consistent image of main DB + committed WAL content,
+    and the integrity check runs against that private temp copy.
+
+    Returns the integrity_check result string (``"ok"`` when healthy), or
+    raises the underlying ``sqlite3`` error. The temp snapshot is always
+    removed. Falls back to the read/write probe when
+    ``HERMES_KANBAN_PROBE_RW=1`` is set (escape hatch to old behavior).
+    """
+    import tempfile
+
+    busy_timeout_ms = _resolve_busy_timeout_ms()
+    # Sweep stale probe temps from prior SIGKILLed probes (finally never ran).
+    try:
+        cutoff = time.time() - 3600
+        for stale in path.parent.glob(".probe-*.db"):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".probe-", suffix=".db", dir=str(path.parent)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        src = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True,
+            isolation_level=None, timeout=busy_timeout_ms / 1000.0,
+        )
+        try:
+            src.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            dst = sqlite3.connect(str(tmp_path), isolation_level=None)
+            try:
+                src.backup(dst)
+                row = dst.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        return row[0] if row else None
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+# Periodic owner-side integrity probe (dispatcher tick). The dispatcher is
+# the board's de facto owner (it holds the singleton dispatch lock), so it —
+# not every spawned worker — carries the recurring corruption check. Interval
+# is deliberately coarse: the probe copies the whole DB.
+_PERIODIC_PROBE_INTERVAL_S = 30 * 60
+_PERIODIC_PROBE_LAST: dict[str, float] = {}
+
+
+def _maybe_periodic_integrity_probe(db_path: Path) -> None:
+    """Owner-side recurring integrity check, called from the dispatch tick.
+
+    Runs at most once per ``_PERIODIC_PROBE_INTERVAL_S`` per board path,
+    inside the dispatch tick lock (single prober per board by construction).
+    Uses the same snapshot method as the first-connect guard: no writes to
+    the live DB or sidecars, no checkpoint, no torn reads.
+
+    On corruption: quarantine-backup once and raise
+    :class:`KanbanDbCorruptError`, which the gateway's dispatcher loop
+    already classifies via ``_is_corrupt_board_db_error`` → pauses dispatch
+    for the board and logs loudly. This replaces the detection that was
+    lost when per-worker probes were skipped: workers no longer stampede,
+    so the owner must notice corruption on a timer instead.
+
+    Never lets a probe *mechanism* failure (temp-file IO, lock timeout)
+    take down dispatch — only a genuine corrupt verdict raises.
+    """
+    key = str(db_path)
+    now = time.monotonic()
+    last = _PERIODIC_PROBE_LAST.get(key)
+    if last is not None and (now - last) < _PERIODIC_PROBE_INTERVAL_S:
+        return
+    _PERIODIC_PROBE_LAST[key] = now
+    try:
+        result = _integrity_check_via_snapshot(db_path)
+    except sqlite3.DatabaseError as exc:
+        # Snapshot itself failed to read the DB — treat like the
+        # first-connect guard does: corrupt.
+        backup = _backup_corrupt_db(db_path)
+        raise KanbanDbCorruptError(
+            db_path, backup, f"periodic probe: sqlite refused to read file: {exc}"
+        )
+    except Exception:
+        # Probe mechanism failure (temp file, transient IO): skip this
+        # round; next interval retries. Detection degrades, dispatch lives.
+        _log.warning(
+            "kanban: periodic integrity probe mechanism failed on %s; "
+            "skipping this round",
+            db_path,
+            exc_info=True,
+        )
+        return
+    if (result or "").lower() != "ok":
+        backup = _backup_corrupt_db(db_path)
+        raise KanbanDbCorruptError(
+            db_path, backup, f"periodic probe: integrity_check returned {result!r}"
+        )
+
+
 @contextlib.contextmanager
 def _cross_process_init_lock(path: Path):
     """Serialize first-connect WAL/schema/integrity setup across processes.
@@ -1658,15 +1775,49 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     if str(resolved) in _INITIALIZED_PATHS:
         return
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        # Dispatcher-spawned worker: the dispatcher that spawned this process
+        # holds the singleton dispatch lock and verified this board's
+        # integrity before claiming/spawning. Re-probing here is redundant
+        # work (full-DB scan per spawned process, serialized through the
+        # unbounded first-connect flock) and is what turns one real
+        # corruption into an N-process backup/quarantine stampede. Workers
+        # keep the cheap 100-byte header check in connect(); real corruption
+        # encountered mid-run still surfaces as SQLITE_CORRUPT from normal
+        # queries. Integrity checking is the board owner's job, not every
+        # child's.
+        #
+        # Scope: the skip applies ONLY to the board the dispatcher pinned
+        # via HERMES_KANBAN_DB (it injects the exact resolved path into the
+        # worker env). If a worker somehow connects to a DIFFERENT board's
+        # DB, that board was not verified by this worker's dispatcher and
+        # gets the full probe.
+        pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if pinned:
+            try:
+                if str(Path(pinned).expanduser().resolve()) == str(resolved):
+                    return
+            except OSError:
+                pass
+        # No pinned path (legacy dispatcher) or different board: fall
+        # through to the full probe.
     reason: Optional[str] = None
     try:
-        probe = _sqlite_connect(resolved)
-        try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        if os.environ.get("HERMES_KANBAN_PROBE_RW", "").strip() in ("1", "true", "True"):
+            # Escape hatch: old read/write probe (opens WAL/SHM, may checkpoint).
+            probe = _sqlite_connect(resolved)
+            try:
+                row = probe.execute("PRAGMA integrity_check").fetchone()
+            finally:
+                probe.close()
+            result = row[0] if row else None
+        else:
+            # Default: probe a locked-consistent snapshot. Never writes the
+            # live DB or its sidecars, cannot race the gateway's checkpoints,
+            # and cannot see torn pages (unlike a lock-free immutable probe).
+            result = _integrity_check_via_snapshot(resolved)
+        if (result or "").lower() != "ok":
+            reason = f"integrity_check returned {result!r}"
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
@@ -6980,6 +7131,8 @@ def dispatch_once(
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
+        if not dry_run:
+            _maybe_periodic_integrity_probe(db_path)
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
