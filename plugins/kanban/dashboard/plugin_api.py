@@ -116,22 +116,40 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
+# Paths already passed through init_db() this process — see _conn().
+_INIT_DONE_PATHS: set[str] = set()
+
+
 def _conn(board: Optional[str] = None):
     """Open a kanban_db connection, creating the schema on first use.
 
     Every handler that mutates the DB goes through this so the plugin
     self-heals on a fresh install (no user-visible "no such table"
     error if somebody hits POST /tasks before GET /board).
-    ``init_db`` is idempotent.
+
+    ``init_db`` is called at most ONCE per resolved DB path per process
+    (`_INIT_DONE_PATHS`). It deliberately busts kanban_db's per-process
+    health-probe cache to force re-migration, so calling it on every
+    request re-runs the full integrity probe (a ~25MB snapshot copy of
+    the board DB) per request — the gateway's kanban_watchers already
+    avoids per-call ``init_db`` for exactly this reason. Subsequent
+    calls go straight to ``connect()``, which self-initializes fresh
+    DBs anyway; the once-guard only skips the forced re-migration.
 
     ``board`` is the query-param slug (already normalised by
     :func:`_resolve_board`). When ``None`` the active board is used
     via the resolution chain (env var → ``current`` file → ``default``).
     """
     try:
-        kanban_db.init_db(board=board)
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
+        key = str(kanban_db.kanban_db_path(board=board).resolve())
+    except Exception:
+        key = board or ""
+    if key not in _INIT_DONE_PATHS:
+        try:
+            kanban_db.init_db(board=board)
+            _INIT_DONE_PATHS.add(key)
+        except Exception as exc:
+            log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
 
 
